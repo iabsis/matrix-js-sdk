@@ -62,7 +62,6 @@ export function MatrixCall(opts) {
     this.webRtc = opts.webRtc;
     this.forceTURN = opts.forceTURN;
     this.URL = opts.URL;
-    this.isOpenVidu = opts.isOpenVidu;
     // Array of Objects with urls, username, credential keys
     this.turnServers = opts.turnServers || [];
     if (this.turnServers.length === 0 && this.client.isFallbackICEServerAllowed()) {
@@ -93,8 +92,6 @@ export function MatrixCall(opts) {
     this.screenSharingStream = null;
 
     this._answerContent = null;
-
-    this.participants = [];
 }
 /** The length of time a call can be ringing for. */
 MatrixCall.CALL_TIMEOUT_MS = 60000;
@@ -150,17 +147,11 @@ MatrixCall.prototype.placeVoiceCall = function() {
 MatrixCall.prototype.placeVideoCall = function(remoteVideoElement, localVideoElement) {
     debuglog("placeVideoCall");
     checkForErrorListener(this);
-
     this.localVideoElement = localVideoElement;
     this.remoteVideoElement = remoteVideoElement;
+    _placeCallWithConstraints(this, _getUserMediaVideoContraints('video'));
     this.type = 'video';
-    if(this.isOpenVidu) {
-        _placeOpenViduCall(this);
-    }else{
-        _placeCallWithConstraints(this, _getUserMediaVideoContraints('video'));
-
-        _tryPlayRemoteStream(this);
-    }
+    _tryPlayRemoteStream(this);
 };
 
 /**
@@ -185,7 +176,7 @@ MatrixCall.prototype.placeScreenSharingCall =
         debuglog("Got screen stream, requesting audio stream...");
         const audioConstraints = _getUserMediaVideoContraints('voice');
         _placeCallWithConstraints(self, audioConstraints);
-    } catch (err) {
+    } catch(err) {
         self.emit("error",
             callError(
                 MatrixCall.ERR_NO_USER_MEDIA,
@@ -354,16 +345,14 @@ MatrixCall.prototype.setRemoteAudioElement = function(element) {
  */
 MatrixCall.prototype._initWithInvite = function(event) {
     this.msg = event.getContent();
-    if(!this.msg.isOpenVidu) {
-        this.peerConn = _createPeerConnection(this);
-        const self = this;
-        if (this.peerConn) {
-            this.peerConn.setRemoteDescription(
-                new this.webRtc.RtcSessionDescription(this.msg.offer),
-                hookCallback(self, self._onSetRemoteDescriptionSuccess),
-                hookCallback(self, self._onSetRemoteDescriptionError),
-            );
-        }
+    this.peerConn = _createPeerConnection(this);
+    const self = this;
+    if (this.peerConn) {
+        this.peerConn.setRemoteDescription(
+            new this.webRtc.RtcSessionDescription(this.msg.offer),
+            hookCallback(self, self._onSetRemoteDescriptionSuccess),
+            hookCallback(self, self._onSetRemoteDescriptionError),
+        );
     }
     setState(this, 'ringing');
     this.direction = 'inbound';
@@ -372,7 +361,6 @@ MatrixCall.prototype._initWithInvite = function(event) {
     // starts getting media on them so we need to figure out whether a video
     // channel has been offered by ourselves.
     if (
-        !this.msg.isOpenVidu &&
         this.msg.offer &&
         this.msg.offer.sdp &&
         this.msg.offer.sdp.indexOf('m=video') > -1
@@ -382,9 +370,6 @@ MatrixCall.prototype._initWithInvite = function(event) {
         this.type = 'voice';
     }
 
-    if(this.msg.isOpenVidu ) {
-        this.type = 'video';
-    }
     if (event.getAge()) {
         setTimeout(function() {
             if (self.state == 'ringing') {
@@ -418,7 +403,7 @@ MatrixCall.prototype._initWithHangup = function(event) {
  * Answer a call.
  */
 MatrixCall.prototype.answer = function() {
-    debuglog("Answering call %s of type %s", this.callId, this.type, this.isOpenVidu);
+    debuglog("Answering call %s of type %s", this.callId, this.type);
     const self = this;
 
     if (self._answerContent) {
@@ -426,27 +411,17 @@ MatrixCall.prototype.answer = function() {
         return;
     }
 
-    if(!this.isOpenVidu) {
-        if (!this.localAVStream && !this.waitForLocalAVStream) {
-            this.webRtc.getUserMedia(
-                _getUserMediaVideoContraints(this.type),
-                hookCallback(self, self._maybeGotUserMediaForAnswer),
-                hookCallback(self, self._maybeGotUserMediaForAnswer),
-            );
-            setState(this, 'wait_local_media');
-        } else if (this.localAVStream) {
-            this._maybeGotUserMediaForAnswer(this.localAVStream);
-        } else if (this.waitForLocalAVStream) {
-            setState(this, 'wait_local_media');
-        }
-    }else{
-        self._answerContent = {
-            version: 0,
-            call_id: self.callId,
-
-        };
-        self._sendAnswer();
-        // setState(this, 'wait_local_media');
+    if (!this.localAVStream && !this.waitForLocalAVStream) {
+        this.webRtc.getUserMedia(
+            _getUserMediaVideoContraints(this.type),
+            hookCallback(self, self._maybeGotUserMediaForAnswer),
+            hookCallback(self, self._maybeGotUserMediaForAnswer),
+        );
+        setState(this, 'wait_local_media');
+    } else if (this.localAVStream) {
+        this._maybeGotUserMediaForAnswer(this.localAVStream);
+    } else if (this.waitForLocalAVStream) {
+        setState(this, 'wait_local_media');
     }
 };
 
@@ -759,22 +734,17 @@ MatrixCall.prototype._gotRemoteIceCandidate = function(cand) {
  * @param {Object} msg
  */
 MatrixCall.prototype._receivedAnswer = function(msg) {
-    console.log('MO: recieve answer');
     if (this.state == 'ended') {
         return;
     }
 
     const self = this;
-    if(!this.isOpenVidu) {
-        this.peerConn.setRemoteDescription(
-            new this.webRtc.RtcSessionDescription(msg.answer),
-            hookCallback(self, self._onSetRemoteDescriptionSuccess),
-            hookCallback(self, self._onSetRemoteDescriptionError),
-        );
-        setState(self, 'connecting');
-    }else{
-        setState(self, 'connected');
-    }
+    this.peerConn.setRemoteDescription(
+        new this.webRtc.RtcSessionDescription(msg.answer),
+        hookCallback(self, self._onSetRemoteDescriptionSuccess),
+        hookCallback(self, self._onSetRemoteDescriptionError),
+    );
+    setState(self, 'connecting');
 };
 
 /**
@@ -999,7 +969,6 @@ MatrixCall.prototype._onRemoteStreamTrackStarted = function(event) {
  * @param {Object} msg
  */
 MatrixCall.prototype._onHangupReceived = function(msg) {
-    console.log('hangup : ', msg);
     debuglog("Hangup received");
     terminate(this, "remote", msg.reason, true);
 };
@@ -1247,47 +1216,6 @@ const _placeCallWithConstraints = function(self, constraints) {
     self.config = constraints;
 };
 
-const _placeOpenViduCall = function(self) {
-    console.log('---------- place open vidu call -----');
-    self.client.callList[self.callId] = self;
-    self.direction = 'outbound';
-    const content = {
-        version: 0,
-        call_id: self.callId,
-        // OpenWebRTC appears to add extra stuff (like the DTLS fingerprint)
-        // to the description when setting it on the peerconnection.
-        // According to the spec it should only add ICE
-        // candidates. Any ICE candidates that have already been generated
-        // at this point will probably be sent both in the offer and separately.
-        // Also, note that we have to make a new object here, copying the
-        // type and sdp properties.
-        // Passing the RTCSessionDescription object as-is doesn't work in
-        // Chrome (as of about m43).
-        isOpenVidu: true,
-
-        lifetime: MatrixCall.CALL_TIMEOUT_MS,
-    };
-    sendEvent(self, 'm.call.invite', content).then(() => {
-        setState(self, 'invite_sent');
-        setTimeout(function() {
-            if (self.state == 'invite_sent') {
-                self.hangup('invite_timeout');
-            }
-        }, MatrixCall.CALL_TIMEOUT_MS);
-    }).catch((error) => {
-        let code = MatrixCall.ERR_SEND_INVITE;
-        let message = "Failed to send invite";
-        if (error.name == 'UnknownDeviceError') {
-            code = MatrixCall.ERR_UNKNOWN_DEVICES;
-            message = "Unknown devices present in the room";
-        }
-
-        self.client.cancelPendingEvent(error.event);
-        terminate(self, "local", code, false);
-        self.emit("error", callError(code, message));
-        throw error;
-    });
-};
 const _createPeerConnection = function(self) {
     const pc = new self.webRtc.RtcPeerConnection({
         iceTransportPolicy: self.forceTURN ? 'relay' : undefined,
@@ -1467,17 +1395,6 @@ export function createNewMatrixCall(client, roomId, options) {
         turnServers: client.getTurnServers(),
         // call level options
         forceTURN: client._forceTURN || optionsForceTURN,
-    };
-    return new MatrixCall(opts);
-}
-
-export function createNewMatrixOpenViduCall(client, roomId) {
-    const opts = {
-
-        client: client,
-
-        roomId: roomId,
-        isOpenVidu: true,
     };
     return new MatrixCall(opts);
 }

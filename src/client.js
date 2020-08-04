@@ -3,13 +3,10 @@ Copyright 2015, 2016 OpenMarket Ltd
 Copyright 2017 Vector Creations Ltd
 Copyright 2018-2019 New Vector Ltd
 Copyright 2019 The Matrix.org Foundation C.I.C.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -32,7 +29,7 @@ import {EventStatus, MatrixEvent} from "./models/event";
 import {EventTimeline} from "./models/event-timeline";
 import {SearchResult} from "./models/search-result";
 import {StubStore} from "./store/stub";
-import {createNewMatrixCall} from "./webrtc/call";
+import {createNewOpenViduCall } from "./webrtc/openViduCall";
 import * as utils from './utils';
 import {sleep} from './utils';
 import {
@@ -110,6 +107,9 @@ function keyFromRecoverySession(session, decryptionKey) {
  *     Should only be useful for devices with end-to-end crypto enabled.
  *     If provided, opts.deviceId and opts.userId should **NOT** be provided
  *     (they are present in the exported data).
+ *
+ * @param {string} opts.pickleKey Key used to pickle olm objects or other
+ *     sensitive data.
  *
  * @param {string} opts.pickleKey Key used to pickle olm objects or other
  *     sensitive data.
@@ -318,7 +318,7 @@ export function MatrixClient(opts) {
 
     // try constructing a MatrixCall to see if we are running in an environment
     // which has WebRTC. If we are, listen for and handle m.call.* events.
-    const call = createNewMatrixCall(this);
+    const call = createNewOpenViduCall(this);
     this._supportsVoip = false;
     if (call) {
         setupCallEventHandler(this);
@@ -643,6 +643,8 @@ MatrixClient.prototype.getCapabilities = function(fresh=false) {
             logger.log("Returning cached capabilities");
             return Promise.resolve(this._cachedCapabilities.capabilities);
         }
+    } else if (opts.pickleKey) {
+        this.pickleKey = opts.pickleKey;
     }
 
     // We swallow errors because we need a default object anyhow
@@ -984,6 +986,20 @@ MatrixClient.prototype.getVerificationRequestsToDeviceInProgress = function(user
 };
 
 /**
+ * Returns all to-device verification requests that are already in progress for the given user id
+ *
+ * @param {string} userId the ID of the user to query
+ *
+ * @returns {module:crypto/verification/request/VerificationRequest[]} the VerificationRequests that are in progress
+ */
+MatrixClient.prototype.getVerificationRequestsToDeviceInProgress = function(userId) {
+    if (this._crypto === null) {
+        throw new Error("End-to-end encryption disabled");
+    }
+    return this._crypto.getVerificationRequestsToDeviceInProgress(userId);
+};
+
+/**
  * Request a key verification from another user.
  *
  * @param {string} userId the user to request verification with
@@ -1158,6 +1174,7 @@ function wrapCryptoFuncs(MatrixClient, names) {
  * @param {module:models/room} room the room the event is in
  */
 wrapCryptoFuncs(MatrixClient, [
+    "resetCrossSigningKeys",
     "getCrossSigningId",
     "getStoredCrossSigningForUser",
     "checkUserTrust",
@@ -1868,7 +1885,6 @@ MatrixClient.prototype.restoreKeyBackupWithSecretStorage = async function(
  * Restores all sessions if omitted.
  * @param {object} backupInfo Backup metadata from `checkKeyBackup`
  * @param {object} opts Optional params such as callbacks
-
  * @return {Promise<object>} Status of restoration with `total` and `imported`
  * key counts.
  */
@@ -3983,7 +3999,6 @@ MatrixClient.prototype.setGuestAccess = function(roomId, opts) {
  * the server requires the id_server parameter to be provided.
  *
  * Parameters and return value are as for requestEmailToken
-
  * @param {string} email As requestEmailToken
  * @param {string} clientSecret As requestEmailToken
  * @param {number} sendAttempt As requestEmailToken
@@ -5131,6 +5146,7 @@ function setupCallEventHandler(client) {
         let i;
         //console.info("RECV %s content=%s", event.getType(), JSON.stringify(content));
 
+        window.lastEvent = event;
         if (event.getType() === "m.call.invite") {
             if (event.getSender() === client.credentials.userId) {
                 return; // ignore invites you send
@@ -5151,7 +5167,7 @@ function setupCallEventHandler(client) {
                 );
             }
 
-            call = createNewMatrixCall(client, event.getRoomId(), {
+            call = createNewOpenViduCall(client, event.getRoomId(), {
                 forceTURN: client._forceTURN,
             });
             if (!call) {
@@ -5217,10 +5233,12 @@ function setupCallEventHandler(client) {
                 client.emit("Call.incoming", call);
             }
         } else if (event.getType() === 'm.call.answer') {
+            console.log('answer event 1111111111111', call, content, client.callList);
             if (!call) {
                 return;
             }
             if (event.getSender() === client.credentials.userId) {
+                console.log('answeed by me :::::::::::::');
                 if (call.state === 'ringing') {
                     call._onAnsweredElsewhere(content);
                 }
@@ -5251,7 +5269,7 @@ function setupCallEventHandler(client) {
                 // if not live, store the fact that the call has ended because
                 // we're probably getting events backwards so
                 // the hangup will come before the invite
-                call = createNewMatrixCall(client, event.getRoomId());
+                call = createNewOpenViduCall(client, event.getRoomId());
                 if (call) {
                     call.callId = content.call_id;
                     call._initWithHangup(event);

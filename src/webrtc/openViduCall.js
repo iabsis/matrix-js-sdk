@@ -1,0 +1,967 @@
+/*
+Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2017 New Vector Ltd
+Copyright 2019 The Matrix.org Foundation C.I.C.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+/**
+ * This is an internal module. See {@link createNewOpenViduCall} for the public API.
+ * @module webrtc/call
+ */
+
+import {logger} from '../logger';
+import {EventEmitter} from "events";
+import * as utils from "../utils";
+
+const DEBUG = true;  // set true to enable console logging.
+
+// events: hangup, error(err), replaced(call), state(state, oldState)
+
+/**
+ * Fires whenever an error occurs when call.js encounters an issue with setting up the call.
+ * <p>
+ * The error given will have a code equal to either `OpenViduCall.ERR_LOCAL_OFFER_FAILED` or
+ * `OpenViduCall.ERR_NO_USER_MEDIA`. `ERR_LOCAL_OFFER_FAILED` is emitted when the local client
+ * fails to create an offer. `ERR_NO_USER_MEDIA` is emitted when the user has denied access
+ * to their audio/video hardware.
+ *
+ * @event module:webrtc/call~OpenViduCall#"error"
+ * @param {Error} err The error raised by OpenViduCall.
+ * @example
+ * OpenViduCall.on("error", function(err){
+ *   console.error(err.code, err);
+ * });
+ */
+
+/**
+ * Construct a new Matrix Call.
+ * @constructor
+ * @param {Object} opts Config options.
+ * @param {string} opts.roomId The room ID for this call.
+ * @param {Object} opts.webRtc The WebRTC globals from the browser.
+ * @param {boolean} opts.forceTURN whether relay through TURN should be forced.
+ * @param {Object} opts.URL The URL global.
+ * @param {Array<Object>} opts.turnServers Optional. A list of TURN servers.
+ * @param {MatrixClient} opts.client The Matrix Client instance to send events to.
+ */
+export function OpenViduCall(opts) {
+    this.roomId = opts.roomId;
+    this.client = opts.client;
+    this.isConference = opts.isConference;
+
+    this.isOpenVidu = true;
+    this.callId = "c" + new Date().getTime() + Math.random();
+    this.state = 'fledgling';
+    this.didConnect = false;
+
+    this.participants = [];
+
+    this._answerContent = null;
+}
+/** The length of time a call can be ringing for. */
+OpenViduCall.CALL_TIMEOUT_MS = 60000;
+/** The fallback ICE server to use for STUN or TURN protocols. */
+OpenViduCall.FALLBACK_ICE_SERVER = 'stun:turn.matrix.org';
+/** An error code when the local client failed to create an offer. */
+OpenViduCall.ERR_LOCAL_OFFER_FAILED = "local_offer_failed";
+/**
+ * An error code when there is no local mic/camera to use. This may be because
+ * the hardware isn't plugged in, or the user has explicitly denied access.
+ */
+OpenViduCall.ERR_NO_USER_MEDIA = "no_user_media";
+
+/*
+ * Error code used when a call event failed to send
+ * because unknown devices were present in the room
+ */
+OpenViduCall.ERR_UNKNOWN_DEVICES = "unknown_devices";
+
+/*
+ * Error code usewd when we fail to send the invite
+ * for some reason other than there being unknown devices
+ */
+OpenViduCall.ERR_SEND_INVITE = "send_invite";
+
+/*
+ * Error code usewd when we fail to send the answer
+ * for some reason other than there being unknown devices
+ */
+OpenViduCall.ERR_SEND_ANSWER = "send_answer";
+
+utils.inherits(OpenViduCall, EventEmitter);
+
+/**
+ * Place a voice call to this room.
+ * @throws If you have not specified a listener for 'error' events.
+ */
+OpenViduCall.prototype.placeVoiceCall = function() {
+    debuglog("placeVoiceCall");
+    checkForErrorListener(this);
+    _placeCallWithConstraints(this, _getUserMediaVideoContraints('voice'));
+    this.type = 'voice';
+};
+
+/**
+ * Place a video call to this room.
+ * @param {Object} session a <code>&lt;video&gt;</code> DOM element
+
+ * to render the local camera preview.
+ * @throws If you have not specified a listener for 'error' events.
+ */
+OpenViduCall.prototype.placeVideoCall = function(session) {
+    debuglog("placeVideoCall");
+    checkForErrorListener(this);
+    this.session = session;
+    // this.remoteVideoElement = remoteVideoElement;
+    // _placeCallWithConstraints(this, _getUserMediaVideoContraints('video'));
+    this.client.callList[this.callId] = this;
+
+    this.direction = 'outbound';
+    this.type = 'video';
+    this._gotLocalOffer();
+    // _tryPlayRemoteStream(this);
+};
+
+/**
+ * Place a screen-sharing call to this room. This includes audio.
+ * <b>This method is EXPERIMENTAL and subject to change without warning. It
+ * only works in Google Chrome and Firefox >= 44.</b>
+ * @param {Element} remoteVideoElement a <code>&lt;video&gt;</code> DOM element
+ * to render video to.
+ * @param {Element} localVideoElement a <code>&lt;video&gt;</code> DOM element
+ * to render the local camera preview.
+ * @throws If you have not specified a listener for 'error' events.
+ */
+OpenViduCall.prototype.placeScreenSharingCall =
+    async function(remoteVideoElement, localVideoElement) {
+    debuglog("placeScreenSharingCall");
+    checkForErrorListener(this);
+    this.localVideoElement = localVideoElement;
+    this.remoteVideoElement = remoteVideoElement;
+    const self = this;
+    try {
+        self.screenSharingStream = await this.webRtc.getDisplayMedia({'audio': false});
+        debuglog("Got screen stream, requesting audio stream...");
+        const audioConstraints = _getUserMediaVideoContraints('voice');
+        _placeCallWithConstraints(self, audioConstraints);
+    } catch(err) {
+        self.emit("error",
+            callError(
+                OpenViduCall.ERR_NO_USER_MEDIA,
+                "Failed to get screen-sharing stream: " + err,
+            ),
+        );
+    }
+
+    this.type = 'video';
+    _tryPlayRemoteStream(this);
+};
+
+/**
+ * Play the given HTMLMediaElement, serialising the operation into a chain
+ * of promises to avoid racing access to the element
+ * @param {Element} element HTMLMediaElement element to play
+ * @param {string} queueId Arbitrary ID to track the chain of promises to be used
+ */
+OpenViduCall.prototype.playElement = function(element, queueId) {
+    logger.log("queuing play on " + queueId + " and element " + element);
+    // XXX: FIXME: Does this leak elements, given the old promises
+    // may hang around and retain a reference to them?
+    if (this.mediaPromises[queueId]) {
+        // XXX: these promises can fail (e.g. by <video/> being unmounted whilst
+        // pending receiving media to play - e.g. whilst switching between
+        // rooms before answering an inbound call), and throw unhandled exceptions.
+        // However, we should soldier on as best we can even if they fail, given
+        // these failures may be non-fatal (as in the case of unmounts)
+        this.mediaPromises[queueId] =
+            this.mediaPromises[queueId].then(function() {
+                logger.log("previous promise completed for " + queueId);
+                return element.play();
+            }, function() {
+                logger.log("previous promise failed for " + queueId);
+                return element.play();
+            });
+    } else {
+        this.mediaPromises[queueId] = element.play();
+    }
+};
+
+
+/**
+ * Set the local <code>&lt;video&gt;</code> DOM element. If this call is active,
+ * video will be rendered to it immediately.
+ * @param {Element} element The <code>&lt;video&gt;</code> DOM element.
+ */
+OpenViduCall.prototype.setLocalVideoElement = function(element) {
+    this.localVideoElement = element;
+
+    if (element && this.localAVStream && this.type === 'video') {
+        element.autoplay = true;
+        this.assignElement(element, this.localAVStream, "localVideo");
+        element.muted = true;
+        const self = this;
+        setTimeout(function() {
+            const vel = self.getLocalVideoElement();
+            if (vel.play) {
+                self.playElement(vel, "localVideo");
+            }
+        }, 0);
+    }
+};
+
+/**
+ * Set the remote <code>&lt;video&gt;</code> DOM element. If this call is active,
+ * the first received video-capable stream will be rendered to it immediately.
+ * @param {Element} element The <code>&lt;video&gt;</code> DOM element.
+ */
+OpenViduCall.prototype.setRemoteVideoElement = function(element) {
+    this.remoteVideoElement = element;
+    _tryPlayRemoteStream(this);
+};
+
+/**
+ * Set the remote <code>&lt;audio&gt;</code> DOM element. If this call is active,
+ * the first received audio-only stream will be rendered to it immediately.
+ * The audio will *not* be rendered from the remoteVideoElement.
+ * @param {Element} element The <code>&lt;video&gt;</code> DOM element.
+ */
+OpenViduCall.prototype.setRemoteAudioElement = function(element) {
+    this.remoteVideoElement.muted = true;
+    this.remoteAudioElement = element;
+    this.remoteAudioElement.muted = false;
+    _tryPlayRemoteAudioStream(this);
+};
+
+/**
+ * Configure this call from an invite event. Used by MatrixClient.
+ * @protected
+ * @param {MatrixEvent} event The m.call.invite event
+ */
+OpenViduCall.prototype._initWithInvite = function(event) {
+    this.msg = event.getContent();
+
+    setState(this, 'ringing');
+    this.direction = 'inbound';
+
+    // firefox and OpenWebRTC's RTCPeerConnection doesn't add streams until it
+    // starts getting media on them so we need to figure out whether a video
+    // channel has been offered by ourselves.
+    // if (
+    //     this.msg.offer &&
+    //     this.msg.offer.sdp &&
+    //     this.msg.offer.sdp.indexOf('m=video') > -1
+    // ) {
+    //     this.type = 'video';
+    // } else {
+    //     this.type = 'voice';
+    // }
+
+    if (event.getAge()) {
+        setTimeout(function() {
+            if (self.state == 'ringing') {
+                debuglog("Call invite has expired. Hanging up.");
+                self.hangupParty = 'remote'; // effectively
+                setState(self, 'ended');
+
+                self.emit("hangup", self);
+            }
+        }, this.msg.lifetime - event.getAge());
+    }
+};
+
+/**
+ * Configure this call from a hangup event. Used by MatrixClient.
+ * @protected
+ * @param {MatrixEvent} event The m.call.hangup event
+ */
+OpenViduCall.prototype._initWithHangup = function(event) {
+    // perverse as it may seem, sometimes we want to instantiate a call with a
+    // hangup message (because when getting the state of the room on load, events
+    // come in reverse order and we want to remember that a call has been hung up)
+    this.msg = event.getContent();
+    setState(this, 'ended');
+};
+
+/**
+ * Answer a call.
+ */
+OpenViduCall.prototype.answer = function() {
+    debuglog("Answering call %s of type %s", this.callId, this.type);
+    const self = this;
+
+    self._sendAnswer();
+
+    setState(this, 'connected');
+};
+
+/**
+ * Replace this call with a new call, e.g. for glare resolution. Used by
+ * MatrixClient.
+ * @protected
+ * @param {OpenViduCall} newCall The new call.
+ */
+OpenViduCall.prototype._replacedBy = function(newCall) {
+    debuglog(this.callId + " being replaced by " + newCall.callId);
+   if (this.state == 'invite_sent') {
+        debuglog("Handing local stream to new call");
+        // newCall._maybeGotUserMediaForAnswer(this.localAVStream);
+        // delete(this.localAVStream);
+    }
+    // newCall.localVideoElement = this.localVideoElement;
+    // newCall.remoteVideoElement = this.remoteVideoElement;
+    // newCall.remoteAudioElement = this.remoteAudioElement;
+    // this.successor = newCall;
+    // this.emit("replaced", newCall);
+    // this.hangup(true);
+};
+
+/**
+ * Hangup a call.
+ * @param {string} reason The reason why the call is being hung up.
+ * @param {boolean} suppressEvent True to suppress emitting an event.
+ */
+OpenViduCall.prototype.hangup = function(reason, suppressEvent) {
+    if (this.state == 'ended') return;
+
+    debuglog("Ending call " + this.callId);
+    terminate(this, "local", reason, !suppressEvent);
+    const content = {
+        version: 0,
+        call_id: this.callId,
+        reason: reason,
+    };
+    sendEvent(this, 'm.call.hangup', content);
+};
+
+/**
+ * Set whether the local video preview should be muted or not.
+ * @param {boolean} muted True to mute the local video.
+ */
+OpenViduCall.prototype.setLocalVideoMuted = function(muted) {
+    if (!this.localAVStream) {
+        return;
+    }
+    setTracksEnabled(this.localAVStream.getVideoTracks(), !muted);
+};
+
+/**
+ * Check if local video is muted.
+ *
+ * If there are multiple video tracks, <i>all</i> of the tracks need to be muted
+ * for this to return true. This means if there are no video tracks, this will
+ * return true.
+ * @return {Boolean} True if the local preview video is muted, else false
+ * (including if the call is not set up yet).
+ */
+OpenViduCall.prototype.isLocalVideoMuted = function() {
+    if (!this.localAVStream) {
+        return false;
+    }
+    return !isTracksEnabled(this.localAVStream.getVideoTracks());
+};
+
+/**
+ * Set whether the microphone should be muted or not.
+ * @param {boolean} muted True to mute the mic.
+ */
+OpenViduCall.prototype.setMicrophoneMuted = function(muted) {
+    if (!this.localAVStream) {
+        return;
+    }
+    setTracksEnabled(this.localAVStream.getAudioTracks(), !muted);
+};
+
+/**
+ * Check if the microphone is muted.
+ *
+ * If there are multiple audio tracks, <i>all</i> of the tracks need to be muted
+ * for this to return true. This means if there are no audio tracks, this will
+ * return true.
+ * @return {Boolean} True if the mic is muted, else false (including if the call
+ * is not set up yet).
+ */
+OpenViduCall.prototype.isMicrophoneMuted = function() {
+    if (!this.localAVStream) {
+        return false;
+    }
+    return !isTracksEnabled(this.localAVStream.getAudioTracks());
+};
+
+
+OpenViduCall.prototype._sendAnswer = function(stream) {
+    this._answerContent = {
+        version: 0,
+        call_id: this.callId,
+        answer: {
+            // sdp: self.peerConn.localDescription.sdp,
+            // type: self.peerConn.localDescription.type,
+        },
+    };
+    sendEvent(this, 'm.call.answer', this._answerContent).then(() => {
+        setState(this, 'connecting');
+        // If this isn't the first time we've tried to send the answer,
+        // we may have candidates queued up, so send them now.
+        _sendCandidateQueue(this);
+    }).catch((error) => {
+        // We've failed to answer: back to the ringing state
+        setState(this, 'ringing');
+        this.client.cancelPendingEvent(error.event);
+
+        let code = OpenViduCall.ERR_SEND_ANSWER;
+        let message = "Failed to send answer";
+        if (error.name == 'UnknownDeviceError') {
+            code = OpenViduCall.ERR_UNKNOWN_DEVICES;
+            message = "Unknown devices present in the room";
+        }
+        this.emit("error", callError(code, message));
+        throw error;
+    });
+};
+
+/**
+ * Internal
+ * @private
+ * @param {Object} stream
+ */
+OpenViduCall.prototype._maybeGotUserMediaForAnswer = function(stream) {
+    const self = this;
+    if (self.state == 'ended') {
+        return;
+    }
+
+    const error = stream;
+    if (stream instanceof MediaStream) {
+        const localVidEl = self.getLocalVideoElement();
+
+        if (localVidEl && self.type == 'video') {
+            localVidEl.autoplay = true;
+            this.assignElement(localVidEl, stream, "localVideo");
+            localVidEl.muted = true;
+            setTimeout(function() {
+                const vel = self.getLocalVideoElement();
+                if (vel.play) {
+                    self.playElement(vel, "localVideo");
+                }
+            }, 0);
+        }
+
+        self.localAVStream = stream;
+        setTracksEnabled(stream.getAudioTracks(), true);
+        self.peerConn.addStream(stream);
+    } else if (error.name === 'PermissionDeniedError') {
+        debuglog('User denied access to camera/microphone.' +
+            ' Or possibly you are using an insecure domain. Receiving only.');
+    } else {
+        debuglog('Failed to getUserMedia: ' + error.name);
+        this._getUserMediaFailed(error);
+        return;
+    }
+
+    const constraints = {
+        'mandatory': {
+            'OfferToReceiveAudio': true,
+            'OfferToReceiveVideo': self.type === 'video',
+        },
+    };
+    self.peerConn.createAnswer(function(description) {
+        debuglog("Created answer: ", description);
+        self.peerConn.setLocalDescription(description, function() {
+            self._answerContent = {
+                version: 0,
+                call_id: self.callId,
+                answer: {
+                    sdp: self.peerConn.localDescription.sdp,
+                    type: self.peerConn.localDescription.type,
+                },
+            };
+            self._sendAnswer();
+        }, function() {
+            debuglog("Error setting local description!");
+        }, constraints);
+    }, function(err) {
+        debuglog("Failed to create answer: " + err);
+    });
+    setState(self, 'create_answer');
+};
+
+
+/**
+ * Used by MatrixClient.
+ * @protected
+ * @param {Object} cand
+ */
+OpenViduCall.prototype._gotRemoteIceCandidate = function(cand) {
+    return;
+};
+
+/**
+ * Used by MatrixClient.
+ * @protected
+ * @param {Object} msg
+ */
+OpenViduCall.prototype._receivedAnswer = function(msg) {
+    console.log('Received Answer .....', msg);
+    if (this.state == 'ended') {
+        return;
+    }
+
+    const self = this;
+
+    setState(self, 'connected');
+};
+
+/**
+ * Internal
+ * @private
+ * @param {Object} description
+ */
+OpenViduCall.prototype._gotLocalOffer = function(description) {
+    const self = this;
+    debuglog("Created offer: ", description);
+
+    if (self.state == 'ended') {
+        debuglog("Ignoring newly created offer on call ID " + self.callId +
+            " because the call has ended");
+        return;
+    }
+
+    // self.peerConn.setLocalDescription(description, function() {
+        const content = {
+            version: 0,
+            call_id: self.callId,
+            // OpenWebRTC appears to add extra stuff (like the DTLS fingerprint)
+            // to the description when setting it on the peerconnection.
+            // According to the spec it should only add ICE
+            // candidates. Any ICE candidates that have already been generated
+            // at this point will probably be sent both in the offer and separately.
+            // Also, note that we have to make a new object here, copying the
+            // type and sdp properties.
+            // Passing the RTCSessionDescription object as-is doesn't work in
+            // Chrome (as of about m43).
+            // offer: {
+                // sdp: self.peerConn.localDescription.sdp,
+                // type: self.peerConn.localDescription.type,
+            // },
+            lifetime: OpenViduCall.CALL_TIMEOUT_MS,
+        };
+        console.log(')))))))))))))))))))))))send invite ');
+        sendEvent(self, 'm.call.invite', content).then(() => {
+            setState(self, 'invite_sent');
+            setTimeout(function() {
+                if (self.state == 'invite_sent') {
+                    self.hangup('invite_timeout');
+                }
+            }, OpenViduCall.CALL_TIMEOUT_MS);
+        }).catch((error) => {
+            let code = OpenViduCall.ERR_SEND_INVITE;
+            let message = "Failed to send invite";
+            if (error.name == 'UnknownDeviceError') {
+                code = OpenViduCall.ERR_UNKNOWN_DEVICES;
+                message = "Unknown devices present in the room";
+            }
+
+            self.client.cancelPendingEvent(error.event);
+            terminate(self, "local", code, false);
+            self.emit("error", callError(code, message));
+            throw error;
+        });
+    // }, function() {
+    //     debuglog("Error setting local description!");
+    // });
+};
+
+
+/**
+ * Internal
+ * @private
+ * @param {Object} error
+ */
+OpenViduCall.prototype._getUserMediaFailed = function(error) {
+    terminate(this, "local", 'user_media_failed', false);
+    this.emit(
+        "error",
+        callError(
+            OpenViduCall.ERR_NO_USER_MEDIA,
+            "Couldn't start capturing media! Is your microphone set up and " +
+            "does this app have permission?",
+        ),
+    );
+};
+
+/**
+ * Internal
+ * @private
+ */
+OpenViduCall.prototype._onIceConnectionStateChanged = function() {
+    if (this.state == 'ended') {
+        return; // because ICE can still complete as we're ending the call
+    }
+    debuglog(
+        "Ice connection state changed to: " + this.peerConn.iceConnectionState,
+    );
+    // ideally we'd consider the call to be connected when we get media but
+    // chrome doesn't implement any of the 'onstarted' events yet
+    if (this.peerConn.iceConnectionState == 'completed' ||
+            this.peerConn.iceConnectionState == 'connected') {
+        setState(this, 'connected');
+        this.didConnect = true;
+    } else if (this.peerConn.iceConnectionState == 'failed') {
+        this.hangup('ice_failed');
+    }
+};
+
+/**
+ * Internal
+ * @private
+ */
+OpenViduCall.prototype._onSignallingStateChanged = function() {
+    debuglog(
+        "call " + this.callId + ": Signalling state changed to: " +
+        this.peerConn.signalingState,
+    );
+};
+
+/**
+ * Internal
+ * @private
+ */
+OpenViduCall.prototype._onSetRemoteDescriptionSuccess = function() {
+    debuglog("Set remote description");
+};
+
+/**
+ * Internal
+ * @private
+ * @param {Object} e
+ */
+OpenViduCall.prototype._onSetRemoteDescriptionError = function(e) {
+    debuglog("Failed to set remote description" + e);
+};
+
+/**
+ * Internal
+ * @private
+ * @param {Object} event
+ */
+OpenViduCall.prototype._onAddStream = function(event) {
+    debuglog("Stream id " + event.stream.id + " added");
+
+    const s = event.stream;
+
+    if (s.getVideoTracks().length > 0) {
+        this.type = 'video';
+        this.remoteAVStream = s;
+        this.remoteAStream = s;
+    } else {
+        this.type = 'voice';
+        this.remoteAStream = s;
+    }
+
+    const self = this;
+    forAllTracksOnStream(s, function(t) {
+        debuglog("Track id " + t.id + " added");
+        // not currently implemented in chrome
+        t.onstarted = hookCallback(self, self._onRemoteStreamTrackStarted);
+    });
+
+    if (event.stream.oninactive !== undefined) {
+        event.stream.oninactive = hookCallback(self, self._onRemoteStreamEnded);
+    } else {
+        // onended is deprecated from Chrome 54
+        event.stream.onended = hookCallback(self, self._onRemoteStreamEnded);
+    }
+
+    // not currently implemented in chrome
+    event.stream.onstarted = hookCallback(self, self._onRemoteStreamStarted);
+
+    if (this.type === 'video') {
+        _tryPlayRemoteStream(this);
+        _tryPlayRemoteAudioStream(this);
+    } else {
+        _tryPlayRemoteAudioStream(this);
+    }
+};
+
+/**
+ * Internal
+ * @private
+ * @param {Object} event
+ */
+OpenViduCall.prototype._onRemoteStreamStarted = function(event) {
+    setState(this, 'connected');
+};
+
+/**
+ * Internal
+ * @private
+ * @param {Object} event
+ */
+OpenViduCall.prototype._onRemoteStreamEnded = function(event) {
+    debuglog("Remote stream ended");
+    this.hangupParty = 'remote';
+    setState(this, 'ended');
+    stopAllMedia(this);
+    if (this.peerConn.signalingState != 'closed') {
+        this.peerConn.close();
+    }
+    this.emit("hangup", this);
+};
+
+/**
+ * Internal
+ * @private
+ * @param {Object} event
+ */
+OpenViduCall.prototype._onRemoteStreamTrackStarted = function(event) {
+    setState(this, 'connected');
+};
+
+/**
+ * Used by MatrixClient.
+ * @protected
+ * @param {Object} msg
+ */
+OpenViduCall.prototype._onHangupReceived = function(msg) {
+    debuglog("Hangup received");
+    terminate(this, "remote", msg.reason, true);
+};
+
+/**
+ * Used by MatrixClient.
+ * @protected
+ * @param {Object} msg
+ */
+OpenViduCall.prototype._onAnsweredElsewhere = function(msg) {
+    debuglog("Answered elsewhere");
+    terminate(this, "remote", "answered_elsewhere", true);
+};
+
+const setTracksEnabled = function(tracks, enabled) {
+    for (let i = 0; i < tracks.length; i++) {
+        tracks[i].enabled = enabled;
+    }
+};
+
+const isTracksEnabled = function(tracks) {
+    for (let i = 0; i < tracks.length; i++) {
+        if (tracks[i].enabled) {
+            return true; // at least one track is enabled
+        }
+    }
+    return false;
+};
+
+const setState = function(self, state) {
+    const oldState = self.state;
+    self.state = state;
+    self.emit("state", state, oldState);
+    console.log('set call state000000000000000000000', state, self);
+};
+
+/**
+ * Internal
+ * @param {OpenViduCall} self
+ * @param {string} eventType
+ * @param {Object} content
+ * @return {Promise}
+ */
+const sendEvent = function(self, eventType, content) {
+    return self.client.sendEvent(self.roomId, eventType, content);
+};
+
+
+const terminate = function(self, hangupParty, hangupReason, shouldEmit) {
+    console.log('Terminate call');
+    // if (self.getRemoteVideoElement()) {
+    //     if (self.getRemoteVideoElement().pause) {
+    //         self.pauseElement(self.getRemoteVideoElement(), "remoteVideo");
+    //     }
+    //     self.assignElement(self.getRemoteVideoElement(), null, "remoteVideo");
+    // }
+    // if (self.getRemoteAudioElement()) {
+    //     if (self.getRemoteAudioElement().pause) {
+    //         self.pauseElement(self.getRemoteAudioElement(), "remoteAudio");
+    //     }
+    //     self.assignElement(self.getRemoteAudioElement(), null, "remoteAudio");
+    // }
+    // if (self.getLocalVideoElement()) {
+    //     if (self.getLocalVideoElement().pause) {
+    //         self.pauseElement(self.getLocalVideoElement(), "localVideo");
+    //     }
+    //     self.assignElement(self.getLocalVideoElement(), null, "localVideo");
+    // }
+    self.hangupParty = hangupParty;
+    self.hangupReason = hangupReason;
+    setState(self, 'ended');
+    // stopAllMedia(self);
+    // if (self.peerConn && self.peerConn.signalingState !== 'closed') {
+    //     self.peerConn.close();
+    // }
+    if (shouldEmit) {
+        self.emit("hangup", self);
+    }
+};
+
+const _tryPlayRemoteStream = function(self) {
+
+
+};
+
+const _tryPlayRemoteAudioStream = async function(self) {
+    if (self.getRemoteAudioElement() && self.remoteAStream) {
+        const player = self.getRemoteAudioElement();
+
+        // if audioOutput is non-default:
+        if (audioOutput) await player.setSinkId(audioOutput);
+
+        player.autoplay = true;
+        self.assignElement(player, self.remoteAStream, "remoteAudio");
+        setTimeout(function() {
+            const ael = self.getRemoteAudioElement();
+            if (ael.play) {
+                self.playElement(ael, "remoteAudio");
+            }
+            // OpenWebRTC does not support oniceconnectionstatechange yet
+            if (self.webRtc.isOpenWebRTC()) {
+                setState(self, 'connected');
+            }
+        }, 0);
+    }
+};
+
+const checkForErrorListener = function(self) {
+    if (self.listeners("error").length === 0) {
+        throw new Error(
+            "You MUST attach an error listener using call.on('error', function() {})",
+        );
+    }
+};
+
+const callError = function(code, msg) {
+    const e = new Error(msg);
+    e.code = code;
+    return e;
+};
+
+const debuglog = function() {
+    if (DEBUG) {
+        logger.log(...arguments);
+    }
+};
+
+const _sendCandidateQueue = function(self) {
+
+
+};
+
+const _placeCallWithConstraints = function(self, constraints) {
+
+};
+
+
+const _getUserMediaVideoContraints = function(callType) {
+    // const isWebkit = !!global.window.navigator.webkitGetUserMedia;
+
+    // switch (callType) {
+    //     case 'voice':
+    //         return {
+    //             audio: {
+    //                 deviceId: audioInput ? {ideal: audioInput} : undefined,
+    //             }, video: false,
+    //         };
+    //     case 'video':
+    //         return {
+    //             audio: {
+    //                 deviceId: audioInput ? {ideal: audioInput} : undefined,
+    //             }, video: {
+    //                 deviceId: videoInput ? {ideal: videoInput} : undefined,
+    //                 /* We want 640x360.  Chrome will give it only if we ask exactly,
+    //                    FF refuses entirely if we ask exactly, so have to ask for ideal
+    //                    instead */
+    //                 width: isWebkit ? { exact: 640 } : { ideal: 640 },
+    //                 height: isWebkit ? { exact: 360 } : { ideal: 360 },
+    //             },
+    //         };
+    // }
+};
+
+const hookCallback = function(call, fn) {
+    return function() {
+        return fn.apply(call, arguments);
+    };
+};
+
+const forAllVideoTracksOnStream = function(s, f) {
+    const tracks = s.getVideoTracks();
+    for (let i = 0; i < tracks.length; i++) {
+        f(tracks[i]);
+    }
+};
+
+const forAllAudioTracksOnStream = function(s, f) {
+    const tracks = s.getAudioTracks();
+    for (let i = 0; i < tracks.length; i++) {
+        f(tracks[i]);
+    }
+};
+
+const forAllTracksOnStream = function(s, f) {
+    forAllVideoTracksOnStream(s, f);
+    forAllAudioTracksOnStream(s, f);
+};
+
+let audioOutput;
+let audioInput;
+let videoInput;
+/**
+ * Set an audio output device to use for OpenViduCalls
+ * @function
+ * @param {string=} deviceId the identifier for the device
+ * undefined treated as unset
+ */
+export function setAudioOutput(deviceId) { audioOutput = deviceId; }
+/**
+ * Set an audio input device to use for OpenViduCalls
+ * @function
+ * @param {string=} deviceId the identifier for the device
+ * undefined treated as unset
+ */
+export function setAudioInput(deviceId) { audioInput = deviceId; }
+/**
+ * Set a video input device to use for OpenViduCalls
+ * @function
+ * @param {string=} deviceId the identifier for the device
+ * undefined treated as unset
+ */
+export function setVideoInput(deviceId) { videoInput = deviceId; }
+
+/**
+ * Create a new Matrix call for the browser.
+ * @param {MatrixClient} client The client instance to use.
+ * @param {string} roomId The room the call is in.
+ * @param {Object?} options DEPRECATED optional options map.
+ * @param {boolean} options.forceTURN DEPRECATED whether relay through TURN should be
+ * forced. This option is deprecated - use opts.forceTURN when creating the matrix client
+ * since it's only possible to set this option on outbound calls.
+ * @return {OpenViduCall} the call or null if the browser doesn't support calling.
+ */
+export function createNewOpenViduCall(client, roomId, options) {
+    const opts = {
+        client: client,
+        roomId: roomId,
+    };
+    return new OpenViduCall(opts);
+}
+

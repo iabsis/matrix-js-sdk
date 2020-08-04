@@ -54,11 +54,11 @@ export * from "./crypto/store/indexeddb-crypto-store";
 export * from "./content-repo";
 export const ContentHelpers = import("./content-helpers");
 export {
-    createNewMatrixCall,
+    createNewOpenViduCall as createNewMatrixCall,
     setAudioOutput as setMatrixCallAudioOutput,
     setAudioInput as setMatrixCallAudioInput,
     setVideoInput as setMatrixCallVideoInput,
-} from "./webrtc/call";
+} from "./webrtc/openViduCall";
 
 
 // expose the underlying request object so different environments can use
